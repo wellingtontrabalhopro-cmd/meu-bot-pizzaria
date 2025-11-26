@@ -1,55 +1,93 @@
 /**
  * --- SERVIDOR BACKEND (PARA RENDER.COM) ---
- * 
- * Este arquivo deve ser salvo como 'index.js' na sua pasta do servidor.
- * Você também precisará do arquivo 'package.json' atualizado na mesma pasta.
+ * Salve este arquivo como 'index.js' no seu repositório.
  */
 
 import express from 'express';
 import axios from 'axios';
+import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
+
+// Habilita CORS para que seu Frontend React consiga falar com este Backend
+app.use(cors());
 app.use(express.json());
 
 // --- CONFIGURAÇÕES ---
-// O Render injeta a porta automaticamente na variável process.env.PORT
 const PORT = process.env.PORT || 3000;
 const Z_API_INSTANCE = process.env.Z_API_INSTANCE; 
 const Z_API_TOKEN = process.env.Z_API_TOKEN;       
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
 
-// Inicializa o Gemini
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// --- CÉREBRO DO BOT ---
-// (Substitua isso pelo conteúdo copiado do botão "Copiar Configuração" no Frontend, se desejar atualizar)
-const SYSTEM_INSTRUCTION_BASE = `
+// --- ESTADO DO SISTEMA (MEMÓRIA) ---
+// Em um app real, isso ficaria num banco de dados.
+
+// Configuração Padrão (será sobrescrita pelo botão "Sincronizar" do Frontend)
+let globalSystemInstruction = `
 VOCÊ É UM ATENDENTE DE PIZZARIA.
 Seu objetivo é anotar pedidos, tirar dúvidas e ser cortês.
 Sempre verifique se o produto está disponível no cardápio abaixo.
 Mantenha as respostas curtas, ideais para WhatsApp.
 `;
 
-const KNOWLEDGE_BASE_MENU = `
-=== CARDÁPIO BÁSICO (ATUALIZE COM O DO APP) ===
-- Pizza Calabresa: R$ 55,00
-- Pizza Muçarela: R$ 50,00
-- Coca Cola: R$ 15,00
+let globalKnowledgeBase = `
+=== CARDÁPIO ===
+(Aguardando sincronização do App...)
 `;
 
-// Memória Volátil (Reinicia se o servidor reiniciar)
+// Histórico de Conversas
 const chatHistory = {};
 
-// --- ROTA HEALTH CHECK (Essencial para o Render não derrubar o app) ---
-app.get('/', (req, res) => {
-    res.status(200).send('Bot está online! 🚀');
+// Pedidos Realizados
+let orders = [];
+
+// --- ROTAS DE ADMINISTRAÇÃO (Conectam com o React App) ---
+
+// 1. Rota para o React enviar a nova configuração
+app.post('/admin/config', (req, res) => {
+    const { systemInstruction, knowledgeBase } = req.body;
+    
+    if (systemInstruction) globalSystemInstruction = systemInstruction;
+    if (knowledgeBase) globalKnowledgeBase = knowledgeBase;
+
+    console.log("✅ Configuração atualizada pelo Frontend!");
+    res.json({ success: true, message: "Cérebro atualizado com sucesso." });
 });
 
-// --- ROTA WEBHOOK (Configure esta URL na Z-API) ---
+// 2. Rota para o React buscar os pedidos (Polling)
+app.get('/admin/orders', (req, res) => {
+    res.json(orders);
+});
+
+// 3. Rota para atualizar status do pedido (Cozinha)
+app.post('/admin/orders/:id/status', (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    const orderIndex = orders.findIndex(o => o.id === id);
+    if (orderIndex !== -1) {
+        orders[orderIndex].status = status;
+        // Opcional: Avisar o cliente no WhatsApp que o status mudou
+        // sendWhatsAppMessage(orders[orderIndex].customerPhone, `Seu pedido mudou para: ${status}`);
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: "Order not found" });
+    }
+});
+
+
+// --- ROTA HEALTH CHECK ---
+app.get('/', (req, res) => {
+    res.status(200).send('Bot Pizza Online 🍕');
+});
+
+// --- ROTA WEBHOOK (Z-API) ---
 app.post('/webhook', async (req, res) => {
   try {
     const data = req.body;
@@ -60,21 +98,21 @@ app.post('/webhook', async (req, res) => {
     }
 
     const userPhone = data.phone;
-    // Tenta pegar o texto de diferentes formatos que a Z-API pode mandar
+    // Tenta pegar o texto de diferentes formatos
     const userText = data.text?.message || data.text || data.caption; 
 
     if (!userText) {
         return res.status(200).send('No text content');
     }
 
-    console.log(`📩 Mensagem de ${userPhone}: ${userText}`);
+    console.log(`📩 Msg de ${userPhone}: ${userText}`);
 
-    // Inicializa histórico para esse número se não existir
+    // Inicializa histórico
     if (!chatHistory[userPhone]) {
         chatHistory[userPhone] = [];
     }
 
-    // Adiciona msg do usuário ao histórico (formato novo do SDK)
+    // Adiciona msg do usuário
     chatHistory[userPhone].push({ role: 'user', parts: [{ text: userText }] });
 
     // Gera resposta com Gemini
@@ -83,43 +121,75 @@ app.post('/webhook', async (req, res) => {
         model: model,
         contents: chatHistory[userPhone],
         config: {
-            systemInstruction: SYSTEM_INSTRUCTION_BASE + "\n\n" + KNOWLEDGE_BASE_MENU
+            systemInstruction: globalSystemInstruction + "\n\n" + globalKnowledgeBase
         }
     });
 
-    const botResponse = result.text;
-    console.log(`🤖 Resposta: ${botResponse}`);
+    let botResponse = result.text;
+    
+    // --- LÓGICA DE DETECÇÃO DE PEDIDO ---
+    // Verifica se o Gemini gerou um bloco de pedido JSON
+    const orderBlockRegex = /!!!ORDER_START!!!([\s\S]*?)!!!ORDER_END!!!/;
+    const match = botResponse.match(orderBlockRegex);
 
-    // Salva resposta do bot no histórico
+    if (match && match[1]) {
+        try {
+            const jsonStr = match[1].trim();
+            const orderData = JSON.parse(jsonStr);
+            
+            // Adiciona ID e Timestamp e salva na memória
+            const newOrder = {
+                id: `ZAP-${Date.now().toString().slice(-4)}`,
+                customerName: orderData.nome_cliente || userPhone,
+                customerPhone: userPhone,
+                address: orderData.endereco_completo || 'Retirada',
+                items: orderData.items || orderData.itens || [],
+                total: orderData.total_numerico || 0,
+                paymentMethod: orderData.forma_pagamento || 'Dinheiro',
+                changeNeeded: orderData.troco_para,
+                status: 'pending',
+                timestamp: Date.now()
+            };
+
+            orders.unshift(newOrder); // Adiciona no início da lista
+            console.log("🍕 NOVO PEDIDO RECEBIDO VIA WHATSAPP:", newOrder.id);
+
+            // Remove o bloco JSON da resposta antes de enviar pro usuário
+            botResponse = botResponse.replace(orderBlockRegex, '').trim();
+            
+            // Adiciona confirmação se não tiver
+            if (!botResponse.includes("pedido confirmado")) {
+                botResponse += "\n\n✅ *Seu pedido foi confirmado e enviado para a cozinha!*";
+            }
+
+        } catch (e) {
+            console.error("Erro ao processar JSON do pedido:", e);
+        }
+    }
+
+    // Salva resposta do bot no histórico (limpa)
     chatHistory[userPhone].push({ role: 'model', parts: [{ text: botResponse }] });
 
-    // Envia para o WhatsApp via Z-API
+    // Envia para o WhatsApp
     await sendWhatsAppMessage(userPhone, botResponse);
 
     res.status(200).send('OK');
 
   } catch (error) {
     console.error('Erro no processamento:', error);
-    // Sempre retorne 200 para o Webhook não ficar tentando reenviar infinitamente em caso de erro lógico
     res.status(200).send('Erro processado'); 
   }
 });
 
 async function sendWhatsAppMessage(phone, message) {
-    if (!Z_API_INSTANCE || !Z_API_TOKEN) {
-        console.error("ERRO: Credenciais da Z-API não configuradas nas Variáveis de Ambiente.");
-        return;
-    }
+    if (!Z_API_INSTANCE || !Z_API_TOKEN) return;
     
     const url = `https://api.z-api.io/instances/${Z_API_INSTANCE}/token/${Z_API_TOKEN}/send-text`;
     
     try {
-        await axios.post(url, {
-            phone: phone,
-            message: message
-        });
+        await axios.post(url, { phone, message });
     } catch (err) {
-        console.error('Falha ao enviar para Z-API:', err.response?.data || err.message);
+        console.error('Z-API Error:', err.message);
     }
 }
 
