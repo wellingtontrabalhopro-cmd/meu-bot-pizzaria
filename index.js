@@ -2,13 +2,15 @@
  * --- SERVIDOR BACKEND (PARA RENDER.COM) ---
  * 
  * Este arquivo deve ser salvo como 'index.js' na sua pasta do servidor.
- * Você também precisará do arquivo 'package.json' na mesma pasta.
+ * Você também precisará do arquivo 'package.json' atualizado na mesma pasta.
  */
 
-const express = require('express');
-const axios = require('axios');
-const { GoogleGenAI } = require('@google/genai');
-require('dotenv').config();
+import express from 'express';
+import axios from 'axios';
+import { GoogleGenAI } from '@google/genai';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
@@ -21,15 +23,15 @@ const Z_API_TOKEN = process.env.Z_API_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
 
 // Inicializa o Gemini
-// NOTA: Se der erro de API Key missing, verifique as Environment Variables no Dashboard da Render.
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 // --- CÉREBRO DO BOT ---
-// (Substitua isso pelo conteúdo copiado do botão "Copiar Configuração" no Frontend)
+// (Substitua isso pelo conteúdo copiado do botão "Copiar Configuração" no Frontend, se desejar atualizar)
 const SYSTEM_INSTRUCTION_BASE = `
 VOCÊ É UM ATENDENTE DE PIZZARIA.
 Seu objetivo é anotar pedidos, tirar dúvidas e ser cortês.
 Sempre verifique se o produto está disponível no cardápio abaixo.
+Mantenha as respostas curtas, ideais para WhatsApp.
 `;
 
 const KNOWLEDGE_BASE_MENU = `
@@ -58,7 +60,8 @@ app.post('/webhook', async (req, res) => {
     }
 
     const userPhone = data.phone;
-    const userText = data.text?.message || data.text; 
+    // Tenta pegar o texto de diferentes formatos que a Z-API pode mandar
+    const userText = data.text?.message || data.text || data.caption; 
 
     if (!userText) {
         return res.status(200).send('No text content');
@@ -66,15 +69,15 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`📩 Mensagem de ${userPhone}: ${userText}`);
 
-    // Inicializa histórico
+    // Inicializa histórico para esse número se não existir
     if (!chatHistory[userPhone]) {
         chatHistory[userPhone] = [];
     }
 
-    // Adiciona msg do usuário
+    // Adiciona msg do usuário ao histórico (formato novo do SDK)
     chatHistory[userPhone].push({ role: 'user', parts: [{ text: userText }] });
 
-    // Gera resposta
+    // Gera resposta com Gemini
     const model = 'gemini-2.5-flash';
     const result = await ai.models.generateContent({
         model: model,
@@ -87,10 +90,10 @@ app.post('/webhook', async (req, res) => {
     const botResponse = result.text;
     console.log(`🤖 Resposta: ${botResponse}`);
 
-    // Salva resposta no histórico
+    // Salva resposta do bot no histórico
     chatHistory[userPhone].push({ role: 'model', parts: [{ text: botResponse }] });
 
-    // Envia para o WhatsApp
+    // Envia para o WhatsApp via Z-API
     await sendWhatsAppMessage(userPhone, botResponse);
 
     res.status(200).send('OK');
@@ -104,7 +107,7 @@ app.post('/webhook', async (req, res) => {
 
 async function sendWhatsAppMessage(phone, message) {
     if (!Z_API_INSTANCE || !Z_API_TOKEN) {
-        console.error("Z-API Credentials missing");
+        console.error("ERRO: Credenciais da Z-API não configuradas nas Variáveis de Ambiente.");
         return;
     }
     
@@ -116,7 +119,7 @@ async function sendWhatsAppMessage(phone, message) {
             message: message
         });
     } catch (err) {
-        console.error('Falha ao enviar Z-API:', err.response?.data || err.message);
+        console.error('Falha ao enviar para Z-API:', err.response?.data || err.message);
     }
 }
 
