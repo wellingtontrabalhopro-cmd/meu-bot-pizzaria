@@ -1,3 +1,4 @@
+
 /**
  * --- SERVIDOR BACKEND (PARA RENDER.COM) ---
  * Salve este arquivo como 'index.js' no seu repositório.
@@ -23,12 +24,13 @@ const Z_API_INSTANCE = process.env.Z_API_INSTANCE;
 const Z_API_TOKEN = process.env.Z_API_TOKEN;       
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
 
+// Validação Inicial
+if (!GEMINI_API_KEY) console.error("❌ ERRO GRAVE: GEMINI_API_KEY não encontrada nas variáveis de ambiente!");
+if (!Z_API_INSTANCE) console.error("❌ ERRO GRAVE: Z_API_INSTANCE não encontrada nas variáveis de ambiente!");
+
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 // --- ESTADO DO SISTEMA (MEMÓRIA) ---
-// Em um app real, isso ficaria num banco de dados.
-
-// Configuração Padrão (será sobrescrita pelo botão "Sincronizar" do Frontend)
 let globalSystemInstruction = `
 VOCÊ É UM ATENDENTE DE PIZZARIA.
 Seu objetivo é anotar pedidos, tirar dúvidas e ser cortês.
@@ -47,40 +49,31 @@ const chatHistory = {};
 // Pedidos Realizados
 let orders = [];
 
-// --- ROTAS DE ADMINISTRAÇÃO (Conectam com o React App) ---
-
-// 1. Rota para o React enviar a nova configuração
+// --- ROTAS DE ADMINISTRAÇÃO ---
 app.post('/admin/config', (req, res) => {
     const { systemInstruction, knowledgeBase } = req.body;
-    
     if (systemInstruction) globalSystemInstruction = systemInstruction;
     if (knowledgeBase) globalKnowledgeBase = knowledgeBase;
-
     console.log("✅ Configuração atualizada pelo Frontend!");
     res.json({ success: true, message: "Cérebro atualizado com sucesso." });
 });
 
-// 2. Rota para o React buscar os pedidos (Polling)
 app.get('/admin/orders', (req, res) => {
     res.json(orders);
 });
 
-// 3. Rota para atualizar status do pedido (Cozinha)
 app.post('/admin/orders/:id/status', (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
-    
     const orderIndex = orders.findIndex(o => o.id === id);
     if (orderIndex !== -1) {
         orders[orderIndex].status = status;
-        // Opcional: Avisar o cliente no WhatsApp que o status mudou
-        // sendWhatsAppMessage(orders[orderIndex].customerPhone, `Seu pedido mudou para: ${status}`);
+        // Se quiser avisar o cliente: sendWhatsAppMessage(orders[orderIndex].customerPhone, `Status: ${status}`);
         res.json({ success: true });
     } else {
         res.status(404).json({ error: "Order not found" });
     }
 });
-
 
 // --- ROTA HEALTH CHECK ---
 app.get('/', (req, res) => {
@@ -91,34 +84,44 @@ app.get('/', (req, res) => {
 app.post('/webhook', async (req, res) => {
   try {
     const data = req.body;
+    
+    // Log para Debug na Render
+    // console.log("📩 Webhook recebido:", JSON.stringify(data));
 
-    // Ignora status de entrega ou mensagens enviadas por mim
-    if (!data || !data.phone || data.fromMe) {
+    // Validações básicas para ignorar status de entrega (ACK) ou mensagens próprias
+    if (!data || !data.phone || data.fromMe || data.status) {
         return res.status(200).send('Ignored');
     }
 
     const userPhone = data.phone;
-    // Tenta pegar o texto de diferentes formatos
-    const userText = data.text?.message || data.text || data.caption; 
+    
+    // Tenta extrair texto de vários lugares possíveis (Texto, Botão, Lista, Legenda)
+    const userText = 
+        data.text?.message || 
+        data.text || 
+        data.caption || 
+        data.buttonsResponseMessage?.message ||
+        data.listResponseMessage?.message;
 
     if (!userText) {
+        console.log(`⚠️ Mensagem sem texto recebida de ${userPhone}. Ignorando.`);
         return res.status(200).send('No text content');
     }
 
-    console.log(`📩 Msg de ${userPhone}: ${userText}`);
+    console.log(`💬 Msg de ${userPhone}: "${userText}"`);
 
     // Inicializa histórico
     if (!chatHistory[userPhone]) {
         chatHistory[userPhone] = [];
     }
 
-    // Adiciona msg do usuário
+    // Adiciona msg do usuário ao histórico
     chatHistory[userPhone].push({ role: 'user', parts: [{ text: userText }] });
 
-    // Gera resposta com Gemini
-    const model = 'gemini-2.5-flash';
+    // --- CHAMADA AO GEMINI ---
+    const modelId = 'gemini-2.5-flash';
     const result = await ai.models.generateContent({
-        model: model,
+        model: modelId,
         contents: chatHistory[userPhone],
         config: {
             systemInstruction: globalSystemInstruction + "\n\n" + globalKnowledgeBase
@@ -126,9 +129,9 @@ app.post('/webhook', async (req, res) => {
     });
 
     let botResponse = result.text;
-    
-    // --- LÓGICA DE DETECÇÃO DE PEDIDO ---
-    // Verifica se o Gemini gerou um bloco de pedido JSON
+    console.log(`🤖 Resposta do Bot: "${botResponse.substring(0, 50)}..."`);
+
+    // --- DETECÇÃO DE PEDIDO (JSON) ---
     const orderBlockRegex = /!!!ORDER_START!!!([\s\S]*?)!!!ORDER_END!!!/;
     const match = botResponse.match(orderBlockRegex);
 
@@ -137,37 +140,34 @@ app.post('/webhook', async (req, res) => {
             const jsonStr = match[1].trim();
             const orderData = JSON.parse(jsonStr);
             
-            // Adiciona ID e Timestamp e salva na memória
             const newOrder = {
                 id: `ZAP-${Date.now().toString().slice(-4)}`,
                 customerName: orderData.nome_cliente || userPhone,
                 customerPhone: userPhone,
                 address: orderData.endereco_completo || 'Retirada',
                 items: orderData.items || orderData.itens || [],
-                total: orderData.total_numerico || 0,
+                total: typeof orderData.total_numerico === 'number' ? orderData.total_numerico : 0,
                 paymentMethod: orderData.forma_pagamento || 'Dinheiro',
                 changeNeeded: orderData.troco_para,
                 status: 'pending',
                 timestamp: Date.now()
             };
 
-            orders.unshift(newOrder); // Adiciona no início da lista
-            console.log("🍕 NOVO PEDIDO RECEBIDO VIA WHATSAPP:", newOrder.id);
+            orders.unshift(newOrder); 
+            console.log("🍕 NOVO PEDIDO SALVO:", newOrder.id);
 
-            // Remove o bloco JSON da resposta antes de enviar pro usuário
+            // Limpa o JSON da resposta para o usuário não ver
             botResponse = botResponse.replace(orderBlockRegex, '').trim();
             
-            // Adiciona confirmação se não tiver
-            if (!botResponse.includes("pedido confirmado")) {
-                botResponse += "\n\n✅ *Seu pedido foi confirmado e enviado para a cozinha!*";
+            if (!botResponse.includes("confirmado")) {
+                botResponse += "\n\n✅ *Pedido enviado para a cozinha!*";
             }
-
         } catch (e) {
-            console.error("Erro ao processar JSON do pedido:", e);
+            console.error("❌ Erro ao ler JSON do pedido:", e);
         }
     }
 
-    // Salva resposta do bot no histórico (limpa)
+    // Atualiza histórico com a resposta do bot
     chatHistory[userPhone].push({ role: 'model', parts: [{ text: botResponse }] });
 
     // Envia para o WhatsApp
@@ -176,20 +176,25 @@ app.post('/webhook', async (req, res) => {
     res.status(200).send('OK');
 
   } catch (error) {
-    console.error('Erro no processamento:', error);
-    res.status(200).send('Erro processado'); 
+    console.error('❌ ERRO NO WEBHOOK:', error);
+    // Retorna 200 para a Z-API não ficar tentando reenviar infinitamente em caso de erro interno
+    res.status(200).send('Error handled'); 
   }
 });
 
 async function sendWhatsAppMessage(phone, message) {
-    if (!Z_API_INSTANCE || !Z_API_TOKEN) return;
+    if (!Z_API_INSTANCE || !Z_API_TOKEN) {
+        console.error("❌ Não consigo enviar msg: Falta Z_API_INSTANCE ou Z_API_TOKEN");
+        return;
+    }
     
     const url = `https://api.z-api.io/instances/${Z_API_INSTANCE}/token/${Z_API_TOKEN}/send-text`;
     
     try {
         await axios.post(url, { phone, message });
+        console.log("✅ Mensagem enviada para o WhatsApp!");
     } catch (err) {
-        console.error('Z-API Error:', err.message);
+        console.error('❌ Erro Z-API:', err.response ? err.response.data : err.message);
     }
 }
 
