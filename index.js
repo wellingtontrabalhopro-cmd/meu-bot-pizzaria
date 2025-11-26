@@ -1,259 +1,217 @@
 
 /**
- * --- SERVIDOR BACKEND (PARA RENDER.COM) ---
- * Versão adaptada para TWILIO
+ * --- SERVIDOR BACKEND (TWILIO VERSION) ---
+ * Configurado para WhatsApp Sandbox
  */
 
 import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
-import dotenv from 'dotenv';
 import twilio from 'twilio';
+import dotenv from 'dotenv';
 
 dotenv.config();
 
 const app = express();
-
-// Habilita CORS
 app.use(cors());
 
-// Twilio envia dados como application/x-www-form-urlencoded
-app.use(express.urlencoded({ extended: true }));
-// Mantemos JSON para as rotas de admin do React
+// O Twilio envia dados como FORM URL ENCODED, não JSON puro no webhook
+app.use(express.urlencoded({ extended: true })); 
 app.use(express.json());
 
-// --- CONFIGURAÇÕES ---
 const PORT = process.env.PORT || 3000;
 
-// Limpeza de espaços em branco nas chaves
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : null; 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID ? process.env.TWILIO_ACCOUNT_SID.trim() : null;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN ? process.env.TWILIO_AUTH_TOKEN.trim() : null;
-// O número do Twilio (ex: whatsapp:+14155238886)
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER ? process.env.TWILIO_PHONE_NUMBER.trim() : null;
+// --- CONFIGURAÇÕES ---
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_NUMBER = process.env.TWILIO_PHONE_NUMBER; // Ex: whatsapp:+14155238886
 
-// --- VALIDAÇÃO INICIAL ---
-console.log("--- INICIANDO BOT (TWILIO VERSION) ---");
-
-if (!GEMINI_API_KEY) console.error("❌ ERRO: GEMINI_API_KEY faltando!");
-else console.log("✅ GEMINI_API_KEY carregada.");
-
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
-    console.error("❌ ERRO: Faltam variáveis do TWILIO (SID, TOKEN ou PHONE_NUMBER).");
-} else {
-    console.log("✅ Credenciais do Twilio carregadas.");
-}
-
-// Inicializa Clientes
+// Inicializa IA
 let ai;
-let twilioClient;
-
-try {
-    if (GEMINI_API_KEY) {
-        ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-        console.log("✅ Gemini inicializado.");
-    }
-    if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
-        twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-        console.log("✅ Cliente Twilio inicializado.");
-    }
-} catch (e) {
-    console.error("❌ Erro na inicialização:", e);
+if (GEMINI_API_KEY) {
+    ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+    console.log("✅ IA Conectada (Google GenAI)");
+} else {
+    console.log("❌ IA desconectada: Falta GEMINI_API_KEY");
 }
 
-// --- ESTADO (MEMÓRIA) ---
-let globalSystemInstruction = `
-VOCÊ É UM ATENDENTE DE PIZZARIA.
-Seu objetivo é anotar pedidos, tirar dúvidas e ser cortês.
-Mantenha as respostas curtas, ideais para WhatsApp.
-`;
+// Inicializa Twilio
+let twilioClient;
+if (TWILIO_SID && TWILIO_TOKEN && TWILIO_NUMBER) {
+    twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
+    console.log("✅ Twilio Conectado");
+} else {
+    console.log("❌ Twilio desconectado: Faltam variáveis de ambiente (SID, TOKEN ou PHONE)");
+}
 
-let globalKnowledgeBase = `
-=== CARDÁPIO ===
-(Aguardando sincronização do App...)
-`;
-
-const chatHistory = {};
+// --- MEMÓRIA ---
+let globalSystemInstruction = "VOCÊ É UM ATENDENTE DE PIZZARIA.";
+let globalKnowledgeBase = "Cardápio vazio.";
+const chatHistory = {}; // Memória simples em tempo de execução
 let orders = [];
 
-// --- ROTAS DE ADMINISTRAÇÃO (IGUAIS) ---
-app.post('/admin/config', (req, res) => {
-    const { systemInstruction, knowledgeBase } = req.body;
-    if (systemInstruction) globalSystemInstruction = systemInstruction;
-    if (knowledgeBase) globalKnowledgeBase = knowledgeBase;
-    console.log("✅ Cérebro atualizado pelo Frontend.");
-    res.json({ success: true });
-});
-
-app.get('/admin/orders', (req, res) => {
-    res.json(orders);
-});
-
-app.post('/admin/orders/:id/status', (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body;
-    const orderIndex = orders.findIndex(o => o.id === id);
-    if (orderIndex !== -1) {
-        orders[orderIndex].status = status;
-        
-        // Opcional: Avisar cliente via Twilio sobre a mudança de status
-        // const customerPhone = orders[orderIndex].customerPhone; // já deve estar com 'whatsapp:+'
-        // sendTwilioMessage(customerPhone, `🔔 Atualização do seu pedido: *${status.toUpperCase()}*`);
-        
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: "Order not found" });
-    }
-});
-
-// --- HELPER DE ENVIO TWILIO ---
-async function sendTwilioMessage(to, body) {
+// Função auxiliar para enviar msg via Twilio
+async function sendWhatsApp(to, body) {
     if (!twilioClient) {
-        console.error("❌ Twilio Client não iniciado.");
+        console.error("Tentativa de envio sem Twilio configurado.");
         return;
     }
     
-    // Garante formato whatsapp:+55...
-    let formattedTo = to;
-    if (!formattedTo.startsWith('whatsapp:')) {
-        formattedTo = `whatsapp:${to}`;
+    // Garante formato whatsapp: no destinatário
+    if (!to.startsWith('whatsapp:')) {
+        to = `whatsapp:${to}`;
+    }
+
+    // Garante formato whatsapp: no remetente (variável de ambiente)
+    let fromNumber = TWILIO_NUMBER;
+    if (!fromNumber.startsWith('whatsapp:')) {
+        fromNumber = `whatsapp:${fromNumber}`;
     }
 
     try {
         await twilioClient.messages.create({
-            from: TWILIO_PHONE_NUMBER, // Deve ser ex: 'whatsapp:+14155238886'
-            to: formattedTo,
+            from: fromNumber,
+            to: to,
             body: body
         });
-        console.log(`✅ Enviado para ${formattedTo}`);
+        console.log(`📤 Enviado para ${to}`);
     } catch (error) {
         console.error("❌ Erro ao enviar Twilio:", error.message);
+        throw error; // Repassa o erro para quem chamou tratar
     }
 }
 
-// --- ROTA DE TESTE ---
-app.get('/teste-zap', async (req, res) => {
-    const { celular } = req.query; // Ex: 5511999999999
-    
-    if (!twilioClient) return res.status(500).json({ success: false, error: "Twilio não configurado no servidor" });
-    
-    try {
-        // Formata para o padrão do Twilio
-        const formattedNum = `whatsapp:+${celular.replace(/\D/g, '')}`;
-        
-        await twilioClient.messages.create({
-            from: TWILIO_PHONE_NUMBER,
-            to: formattedNum,
-            body: "🔔 Teste Bem Sucedido! Seu Bot está conectado ao Twilio."
-        });
+// --- ROTAS ---
+app.get('/', (req, res) => {
+    const statusTwilio = twilioClient ? "✅ ON" : "❌ OFF";
+    const statusAI = ai ? "✅ ON" : "❌ OFF";
+    res.send(`Bot Twilio Online 🍕<br>Status Twilio: ${statusTwilio}<br>Status Gemini: ${statusAI}`);
+});
+
+// Rota para o Frontend atualizar o 'Cérebro'
+app.post('/admin/config', (req, res) => {
+    globalSystemInstruction = req.body.systemInstruction || globalSystemInstruction;
+    globalKnowledgeBase = req.body.knowledgeBase || globalKnowledgeBase;
+    console.log("🧠 Configurações atualizadas via Frontend");
+    res.json({ success: true });
+});
+
+// Rota para Cozinha ver pedidos
+app.get('/admin/orders', (req, res) => res.json(orders));
+
+// Rota para atualizar status do pedido
+app.post('/admin/orders/:id/status', (req, res) => {
+    const order = orders.find(o => o.id === req.params.id);
+    if (order) {
+        order.status = req.body.status;
+        // Avisar cliente via WhatsApp
+        if(order.customerPhone) {
+             sendWhatsApp(order.customerPhone, `🔔 Atualização do seu pedido: *${req.body.status.toUpperCase()}*`);
+        }
         res.json({ success: true });
-    } catch (error) {
-        console.error("Erro teste Twilio:", error);
-        res.status(500).json({ success: false, error: error.message });
+    } else {
+        res.status(404).json({ error: "Pedido não encontrado" });
     }
 });
 
-app.get('/test-keys', (req, res) => {
-    res.json({
-        gemini_ok: !!GEMINI_API_KEY,
-        twilio_sid_ok: !!TWILIO_ACCOUNT_SID,
-        twilio_token_ok: !!TWILIO_AUTH_TOKEN,
-        twilio_number: TWILIO_PHONE_NUMBER || 'MISSING'
-    });
-});
-
-app.get('/', (req, res) => res.send("Bot Twilio Online 🍕"));
-
-// --- WEBHOOK TWILIO ---
-app.post('/webhook', async (req, res) => {
-    // O Twilio envia os dados no req.body (parsed pelo express.urlencoded)
-    // Body: Mensagem
-    // From: whatsapp:+5511999999999
+// Rota de Teste (acionada pelo botão do App)
+app.get('/teste-zap', async (req, res) => {
+    const { celular } = req.query;
+    if (!celular) return res.status(400).json({ error: "Falta celular" });
     
+    // Formata numero (Remove caracteres não numéricos e garante 55 se for BR)
+    let formatted = celular.replace(/\D/g, ''); 
+    if (formatted.length >= 10 && !formatted.startsWith('55')) {
+        formatted = '55' + formatted;
+    }
+
+    try {
+        await sendWhatsApp(formatted, "✅ Teste do Servidor com Twilio: Conexão OK!");
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// --- WEBHOOK (ONDE O TWILIO BATE) ---
+app.post('/webhook', async (req, res) => {
+    // O Twilio manda 'From' (quem enviou) e 'Body' (texto)
     const incomingMsg = req.body.Body;
-    const from = req.body.From; // Já vem com 'whatsapp:+'
+    const from = req.body.From; // Formato: whatsapp:+5511999999999
 
-    console.log(`📨 Twilio msg de ${from}: ${incomingMsg}`);
+    if (!incomingMsg || !from) return res.sendStatus(200);
 
-    if (!incomingMsg || !from) {
-        return res.status(200).send('No content'); 
-    }
+    console.log(`📩 De ${from}: ${incomingMsg}`);
 
-    // Inicializa Histórico
-    if (!chatHistory[from]) {
-        chatHistory[from] = [];
-    }
+    // Inicializa histórico
+    if (!chatHistory[from]) chatHistory[from] = [];
+    
+    // Adiciona msg do usuario
     chatHistory[from].push({ role: 'user', parts: [{ text: incomingMsg }] });
 
-    if (!ai) return res.status(500).send('AI Error');
-
     try {
-        // Gera resposta com Gemini
-        const modelId = 'gemini-2.5-flash';
+        if (!ai) throw new Error("IA não configurada");
+
+        // Gera resposta na IA
         const result = await ai.models.generateContent({
-            model: modelId,
+            model: 'gemini-2.5-flash',
             contents: chatHistory[from],
             config: {
                 systemInstruction: globalSystemInstruction + "\n\n" + globalKnowledgeBase
             }
         });
 
-        let botResponse = result.text;
-        
-        // --- DETECÇÃO DE PEDIDO ---
-        const orderBlockRegex = /!!!ORDER_START!!!([\s\S]*?)!!!ORDER_END!!!/;
-        const match = botResponse.match(orderBlockRegex);
+        let responseText = result.text;
+
+        // --- LÓGICA DE PEDIDO ---
+        const orderRegex = /!!!ORDER_START!!!([\s\S]*?)!!!ORDER_END!!!/;
+        const match = responseText.match(orderRegex);
 
         if (match && match[1]) {
             try {
-                const jsonStr = match[1].trim();
+                const jsonStr = match[1];
                 const orderData = JSON.parse(jsonStr);
-                
-                // Remove prefixo whatsapp: para salvar no banco visualmente mais limpo
-                const cleanPhone = from.replace('whatsapp:', '').replace('+', '');
-                
+
+                // Salva na memória
                 const newOrder = {
-                    id: `TWI-${Date.now().toString().slice(-4)}`,
+                    id: `TW-${Date.now().toString().slice(-4)}`,
                     customerName: orderData.nome_cliente || "Cliente WhatsApp",
-                    customerPhone: cleanPhone, 
-                    address: orderData.endereco_completo || 'Retirada',
-                    items: orderData.items || orderData.itens || [],
-                    total: typeof orderData.total_numerico === 'number' ? orderData.total_numerico : 0,
-                    paymentMethod: orderData.forma_pagamento || 'Dinheiro',
+                    customerPhone: from, // Guarda o ID do Twilio
+                    address: orderData.endereco_completo,
+                    items: orderData.itens || [],
+                    total: orderData.total_numerico || 0,
+                    paymentMethod: orderData.forma_pagamento,
                     changeNeeded: orderData.troco_para,
                     status: 'pending',
                     timestamp: Date.now()
                 };
-
+                
                 orders.unshift(newOrder);
-                console.log("🍕 Pedido Twilio Salvo:", newOrder.id);
+                console.log("🍕 Novo Pedido Registrado:", newOrder.id);
 
-                botResponse = botResponse.replace(orderBlockRegex, '').trim();
-                if (!botResponse.includes("confirmado")) {
-                    botResponse += "\n\n✅ *Pedido confirmado!*";
-                }
-
+                // Remove o bloco JSON da mensagem que vai pro cliente
+                responseText = responseText.replace(orderRegex, '').trim();
+                responseText += "\n\n✅ *Seu pedido foi enviado para a cozinha!*"
             } catch (e) {
-                console.error("Erro parsing JSON order:", e);
+                console.error("Erro ao processar JSON do pedido:", e);
             }
         }
 
-        // Atualiza histórico
-        chatHistory[from].push({ role: 'model', parts: [{ text: botResponse }] });
+        // Salva resposta no histórico
+        chatHistory[from].push({ role: 'model', parts: [{ text: responseText }] });
 
-        // Responde ao Twilio
-        // Podemos usar a biblioteca client.messages.create OU responder com TwiML (XML).
-        // A biblioteca é mais flexível para logs.
-        await sendTwilioMessage(from, botResponse);
-
-        res.status(200).send('OK');
+        // Envia resposta via Twilio Client (Async)
+        await sendWhatsApp(from, responseText);
 
     } catch (error) {
-        console.error("Erro processamento IA:", error);
-        res.status(200).send('Error'); // Sempre retorne 200 pro Twilio não reenviar
+        console.error("Erro no processamento:", error);
+        await sendWhatsApp(from, "Desculpe, tive um erro técnico momentâneo.");
     }
+
+    // O Twilio espera um 200 OK rápido (TwiML vazio)
+    res.type('text/xml');
+    res.send('<Response></Response>');
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor Twilio rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
