@@ -1,6 +1,6 @@
 
 /**
- * --- SERVIDOR BACKEND (MODO API PRÓPRIA / WHATSAPP-WEB.JS) ---
+ * --- SERVIDOR BACKEND (MODO API PRÓPRIA / WHATSAPP-WEB.JS / TWILIO) ---
  */
 
 import express from 'express';
@@ -21,10 +21,26 @@ const PORT = process.env.PORT || 3000;
 // --- CONFIGURAÇÕES ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// URL da sua API whatsapp-web.js (Ex: http://seu-vps-ip:3000/api/send-message)
-// Se sua API for local, use Ngrok para gerar uma URL pública.
+// Configuração TWILIO (Se estiver usando Twilio)
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER;
+
+// Configuração CUSTOM API (Se estiver usando whatsapp-web.js)
 const CUSTOM_SEND_URL = process.env.CUSTOM_SEND_URL; 
-const CUSTOM_API_KEY = process.env.CUSTOM_API_KEY; // Opcional (se vc proteje sua API)
+const CUSTOM_API_KEY = process.env.CUSTOM_API_KEY; 
+
+// Inicializa Twilio Client (se chaves existirem)
+let twilioClient;
+if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+    try {
+        const twilio = await import('twilio'); // Import dinâmico
+        twilioClient = twilio.default(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+        console.log("✅ Cliente Twilio inicializado");
+    } catch (e) {
+        console.error("⚠️ Erro ao carregar biblioteca Twilio:", e.message);
+    }
+}
 
 // Inicializa IA
 let ai;
@@ -35,55 +51,83 @@ if (GEMINI_API_KEY) {
     console.log("❌ IA desconectada: Falta GEMINI_API_KEY");
 }
 
-console.log(`📡 Modo: API CUSTOMIZADA (whatsapp-web.js)`);
-
 // --- MEMÓRIA ---
 let globalSystemInstruction = "VOCÊ É UM ATENDENTE DE PIZZARIA.";
 let globalKnowledgeBase = "Cardápio vazio.";
 const chatHistory = {}; 
 let orders = [];
 
-// --- FUNÇÃO DE ENVIO PARA SUA API ---
+// Função auxiliar para limpar telefone (remove @c.us, +, etc e deixa só numeros)
+const sanitizePhone = (phone) => {
+    if(!phone) return "unknown";
+    return phone.replace(/\D/g, ''); // Remove tudo que não for número
+};
+
+// --- FUNÇÃO CENTRAL DE ENVIO (ROTEADOR) ---
 async function sendWhatsApp(to, body) {
-    if (!CUSTOM_SEND_URL) {
-        console.error("❌ Erro: CUSTOM_SEND_URL não configurada na Render.");
-        return;
-    }
+    const cleanPhone = sanitizePhone(to);
     
-    // Limpa o número (deixa apenas dígitos)
-    // whatsapp-web.js geralmente aceita '551199...' ou '551199...@c.us'
-    let cleanPhone = to.replace('@c.us', '').replace('whatsapp:', '').replace('+', ''); 
-
-    try {
-        // Formato padrão que a maioria das APIs Node espera
-        const payload = {
-            number: cleanPhone, 
-            message: body,
-            text: body // Enviamos os dois para garantir compatibilidade
-        };
-
-        const headers = { 'Content-Type': 'application/json' };
-        if (CUSTOM_API_KEY) headers['Authorization'] = `Bearer ${CUSTOM_API_KEY}`;
-
-        await axios.post(CUSTOM_SEND_URL, payload, { headers });
-        console.log(`📤 Enviado para ${cleanPhone} via API Própria`);
-    } catch (error) {
-        console.error("❌ Erro ao chamar sua API:", error.message);
-        // console.error("Detalhes:", error.response?.data);
+    // 1. Prioridade: TWILIO
+    if (twilioClient && TWILIO_PHONE_NUMBER) {
+        console.log(`📤 [Twilio] Enviando para ${cleanPhone}`);
+        try {
+            // Twilio precisa do formato whatsapp:+55...
+            const from = TWILIO_PHONE_NUMBER.startsWith('whatsapp:') ? TWILIO_PHONE_NUMBER : `whatsapp:${TWILIO_PHONE_NUMBER}`;
+            const toFormatted = `whatsapp:+${cleanPhone}`;
+            
+            await twilioClient.messages.create({
+                from: from,
+                to: toFormatted,
+                body: body
+            });
+            console.log("✅ Enviado via Twilio");
+            return;
+        } catch (error) {
+            console.error("❌ Erro Twilio:", error.message);
+            throw error;
+        }
     }
+
+    // 2. Prioridade: API CUSTOMIZADA (Ngrok/Whatsapp-web.js)
+    if (CUSTOM_SEND_URL) {
+        console.log(`📤 [Custom API] Enviando para ${cleanPhone}`);
+        try {
+            const payload = {
+                number: cleanPhone, 
+                message: body,
+                text: body 
+            };
+            const headers = { 'Content-Type': 'application/json' };
+            if (CUSTOM_API_KEY) headers['Authorization'] = `Bearer ${CUSTOM_API_KEY}`;
+
+            await axios.post(CUSTOM_SEND_URL, payload, { headers, timeout: 10000 });
+            console.log(`✅ Enviado via API Customizada`);
+            return;
+        } catch (error) {
+            console.error("❌ Erro API Customizada:", error.message);
+            throw error;
+        }
+    }
+
+    console.error("❌ NENHUM MÉTODO DE ENVIO CONFIGURADO (Sem Twilio e sem Custom URL)");
 }
 
-// --- ROTAS DE STATUS ---
+// --- ROTAS ---
 app.get('/', (req, res) => {
     res.send(`
-        <h1>Bot Online 🤖</h1>
-        <p>Integrado com API Própria</p>
-        <p>Gemini: ${ai ? '✅' : '❌'}</p>
-        <p>Send URL: ${CUSTOM_SEND_URL ? '✅ Configurado' : '❌ Faltando'}</p>
+        <div style="font-family: sans-serif; padding: 20px;">
+            <h1>🤖 Bot Online</h1>
+            <ul>
+                <li>IA: ${ai ? '✅ ON' : '❌ OFF'}</li>
+                <li>Twilio: ${twilioClient ? '✅ ON' : '⚪ OFF'}</li>
+                <li>Custom API: ${CUSTOM_SEND_URL ? '✅ ON' : '⚪ OFF'}</li>
+                <li>Rota Chats: ✅ /admin/chats (Ativo)</li>
+            </ul>
+        </div>
     `);
 });
 
-// Admin Config (Frontend React chama isso)
+// Admin Config
 app.post('/admin/config', (req, res) => {
     globalSystemInstruction = req.body.systemInstruction || globalSystemInstruction;
     globalKnowledgeBase = req.body.knowledgeBase || globalKnowledgeBase;
@@ -107,57 +151,81 @@ app.post('/admin/orders/:id/status', (req, res) => {
     }
 });
 
+// --- AQUI ESTAVA FALTANDO A ROTA DE CHATS ---
+app.get('/admin/chats', (req, res) => {
+    console.log("🔍 Frontend requisitou lista de chats...");
+    
+    // Converte o objeto chatHistory em um array bonito para o Frontend
+    const chats = Object.keys(chatHistory).map(phoneKey => {
+        const msgs = chatHistory[phoneKey];
+        return {
+            phone: phoneKey,
+            messages: msgs,
+            lastMessageTime: Date.now() // Poderia ser melhorado pegando o timestamp real da ultima msg
+        };
+    });
+    
+    console.log(`📦 Retornando ${chats.length} chats ativos.`);
+    res.json(chats);
+});
+
 // Teste de Envio
 app.get('/teste-zap', async (req, res) => {
     const { celular } = req.query;
     if (!celular) return res.status(400).json({ error: "Falta celular" });
     
-    let formatted = celular.replace(/\D/g, ''); 
-    if (formatted.length >= 10 && !formatted.startsWith('55')) formatted = '55' + formatted;
-
     try {
-        await sendWhatsApp(formatted, "✅ Teste de Conexão: AgentFlow -> Sua API -> WhatsApp");
+        console.log("🧪 Teste iniciado via painel web...");
+        await sendWhatsApp(celular, "✅ Teste de Conexão: AgentFlow -> Seu Zap");
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
-// --- WEBHOOK (ONDE SUA API VAI MANDAR MENSAGEM) ---
+// --- WEBHOOK (Recebe msg do Twilio ou Custom API) ---
 app.post('/webhook', async (req, res) => {
-    // Tenta detectar o formato que sua API está enviando
-    let incomingMsg = req.body.body || req.body.message || req.body.text;
-    let from = req.body.from || req.body.number || req.body.phone;
+    let incomingMsg = "";
+    let rawFrom = "";
 
-    // Se vier objeto complexo (algumas libs mandam obj inteiro)
-    if (typeof incomingMsg === 'object') incomingMsg = JSON.stringify(incomingMsg);
+    console.log("📥 Webhook Recebido:", JSON.stringify(req.body));
 
-    if (!incomingMsg || !from) {
-        console.log("⚠️ Webhook recebido sem 'from' ou 'body'. Payload:", req.body);
-        return res.status(400).send("Formato inválido");
+    // Lógica TWILIO
+    if (req.body.Body && req.body.From) {
+        incomingMsg = req.body.Body;
+        rawFrom = req.body.From; // ex: whatsapp:+5511...
+    } 
+    // Lógica Custom API / Z-API
+    else if (req.body.body || req.body.message || req.body.text) {
+        incomingMsg = req.body.body || req.body.message || req.body.text;
+        rawFrom = req.body.from || req.body.number || req.body.phone;
     }
 
-    // Ignora mensagens de status ou grupos se necessário
-    if (from.includes('@g.us')) return res.send("Ignorando Grupo");
+    if (!incomingMsg || !rawFrom) {
+        return res.status(400).send("Formato desconhecido.");
+    }
 
-    console.log(`📩 De ${from}: ${incomingMsg}`);
+    // Normaliza ID do usuário (Remove + e caracteres especiais para usar como chave)
+    const userKey = sanitizePhone(rawFrom);
 
-    // Cria sessão se não existir
-    if (!chatHistory[from]) chatHistory[from] = [];
-    chatHistory[from].push({ role: 'user', parts: [{ text: incomingMsg }] });
+    // Cria histórico se não existir
+    if (!chatHistory[userKey]) chatHistory[userKey] = [];
+    
+    // Salva msg do usuário
+    chatHistory[userKey].push({ role: 'user', parts: [{ text: incomingMsg }] });
 
     try {
-        if (!ai) throw new Error("IA offline");
+        if (!ai) throw new Error("IA offline (Falta API Key)");
 
         const result = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
-            contents: chatHistory[from],
+            contents: chatHistory[userKey],
             config: { systemInstruction: globalSystemInstruction + "\n\n" + globalKnowledgeBase }
         });
 
         let responseText = result.text;
         
-        // Processa Pedidos (Lógica de JSON Oculto)
+        // Processa Pedidos (JSON oculto)
         const orderRegex = /!!!ORDER_START!!!([\s\S]*?)!!!ORDER_END!!!/;
         const match = responseText.match(orderRegex);
         if (match && match[1]) {
@@ -166,7 +234,7 @@ app.post('/webhook', async (req, res) => {
                 const newOrder = {
                     id: `APP-${Date.now().toString().slice(-4)}`,
                     customerName: orderData.nome_cliente || "Cliente",
-                    customerPhone: from,
+                    customerPhone: userKey,
                     address: orderData.endereco_completo,
                     items: orderData.itens || [],
                     total: orderData.total_numerico || 0,
@@ -176,20 +244,23 @@ app.post('/webhook', async (req, res) => {
                     timestamp: Date.now()
                 };
                 orders.unshift(newOrder);
-                responseText = responseText.replace(orderRegex, '').trim() + "\n\n✅ *Pedido Recebido e enviado para a Cozinha!*";
-            } catch(e) { console.error("Erro ao ler JSON do pedido:", e); }
+                responseText = responseText.replace(orderRegex, '').trim() + "\n\n✅ *Pedido confirmado!*";
+            } catch(e) { console.error("Erro JSON Pedido:", e); }
         }
 
-        chatHistory[from].push({ role: 'model', parts: [{ text: responseText }] });
+        // Salva resposta da IA no histórico
+        chatHistory[userKey].push({ role: 'model', parts: [{ text: responseText }] });
         
-        // Responde usando sua API
-        await sendWhatsApp(from, responseText);
+        // Envia resposta de volta
+        await sendWhatsApp(userKey, responseText);
 
     } catch (error) {
-        console.error("Erro no fluxo da IA:", error);
+        console.error("❌ Erro ao processar IA:", error);
     }
 
-    res.sendStatus(200);
+    // Responde 200 OK para o webhook não reenviar
+    // Twilio prefere XML TwiML, mas aceita 200 vazio se respondemos via API
+    res.status(200).send('<Response></Response>'); 
 });
 
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
