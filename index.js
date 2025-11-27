@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 3000;
 
 // --- DIAGNÓSTICO ---
 let lastWebhookAttempt = "Nenhuma tentativa ainda";
-let lastWebhookPayload = "Nenhum dado";
+let lastWebhookPayload = "Nenhum dado recebido ainda";
 let webhookCount = 0;
 
 // --- CONFIGURAÇÕES ---
@@ -92,7 +92,14 @@ async function sendWhatsApp(to, body) {
     if (CUSTOM_SEND_URL) {
         console.log(`📤 [Custom API] Enviando para ${cleanPhone}`);
         try {
-            await axios.post(CUSTOM_SEND_URL, { number: cleanPhone, message: body, text: body });
+            // Tenta enviar em múltiplos formatos comuns para garantir compatibilidade
+            await axios.post(CUSTOM_SEND_URL, { 
+                number: cleanPhone,     // Formato 1
+                phone: cleanPhone,      // Formato 2
+                chatId: `${cleanPhone}@c.us`, // Formato whatsapp-web.js
+                message: body, 
+                text: body 
+            });
             return;
         } catch (error) {
             console.error("❌ Erro API Customizada:", error.message);
@@ -115,13 +122,12 @@ app.get('/', (req, res) => {
             <br/>
             <ul>
                 <li>IA Google: ${ai ? '✅ CONECTADO' : '❌ DESCONECTADO'}</li>
-                <li>Twilio Config: ${twilioClient ? '✅ SIM' : '⚪ NÃO'}</li>
-                <li>Custom API: ${CUSTOM_SEND_URL ? '✅ SIM' : '⚪ NÃO'}</li>
+                <li>API de Envio (Custom): ${CUSTOM_SEND_URL ? '✅ CONFIGURADA' : '⚪ NÃO CONFIGURADA'}</li>
             </ul>
             <hr/>
-            <h3>Links Importantes:</h3>
-            <p>👉 <b>Webhook URL:</b> ${req.protocol}://${req.get('host')}/webhook</p>
-            <p>(Copie este link e cole no Twilio Sandbox Settings)</p>
+            <h3>Manual Rápido:</h3>
+            <p>Seu código local deve fazer POST para: <b>${req.protocol}://${req.get('host')}/webhook</b></p>
+            <p>JSON Esperado: <code>{ "number": "5511...", "message": "Olá" }</code></p>
         </div>
     `);
 });
@@ -172,71 +178,81 @@ app.post('/webhook', async (req, res) => {
     lastWebhookAttempt = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
     
     console.log("📥 WEBHOOK RECEBIDO!");
-    console.log("📦 Body:", JSON.stringify(req.body));
+    console.log("📦 Body Raw:", JSON.stringify(req.body));
 
-    let incomingMsg = "";
-    let rawFrom = "";
-
-    // Detecção Automática (Twilio vs Custom)
-    if (req.body.Body) {
-        incomingMsg = req.body.Body;
-        rawFrom = req.body.From; // ex: whatsapp:+55...
-        lastWebhookPayload = `Twilio: ${rawFrom} disse "${incomingMsg}"`;
-    } else if (req.body.message || req.body.text) {
-        incomingMsg = req.body.message || req.body.text;
-        rawFrom = req.body.number || req.body.from || req.body.phone;
-        lastWebhookPayload = `Custom: ${rawFrom} disse "${incomingMsg}"`;
-    } else {
-        lastWebhookPayload = "Formato Desconhecido (Body vazio ou chaves erradas)";
-        console.error("❌ Erro: Formato de webhook não reconhecido.");
-        return res.status(400).send("Formato desconhecido.");
-    }
-
-    const userKey = sanitizePhone(rawFrom);
-    if (!chatHistory[userKey]) chatHistory[userKey] = [];
+    const body = req.body || {};
     
-    // Salva msg do usuário
-    chatHistory[userKey].push({ role: 'user', parts: [{ text: incomingMsg }] });
+    // Tentativa Universal de ler a mensagem
+    // Procura por message, text, body, content, etc.
+    const incomingMsg = body.message || body.text || body.Body || body.body || body.content;
+    
+    // Tentativa Universal de ler o número
+    // Procura por number, from, phone, sender, From
+    const rawFrom = body.number || body.from || body.phone || body.sender || body.From || body.remoteJid;
 
-    // Processa IA
-    try {
-        if (!ai) throw new Error("IA offline");
-
-        const result = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: chatHistory[userKey],
-            config: { systemInstruction: globalSystemInstruction + "\n\n" + globalKnowledgeBase }
-        });
-
-        let responseText = result.text;
+    if (incomingMsg && rawFrom) {
+        lastWebhookPayload = `Sucesso: ${rawFrom} enviou "${incomingMsg}"`;
         
-        // Processa Pedidos
-        if (responseText.includes("!!!ORDER_START!!!")) {
-            try {
-                const jsonBlock = responseText.split("!!!ORDER_START!!!")[1].split("!!!ORDER_END!!!")[0];
-                const orderData = JSON.parse(jsonBlock);
-                orders.unshift({
-                    id: `APP-${Date.now().toString().slice(-4)}`,
-                    customerName: orderData.nome_cliente || "Cliente",
-                    customerPhone: userKey,
-                    address: orderData.endereco_completo,
-                    items: orderData.itens || [],
-                    total: orderData.total_numerico || 0,
-                    status: 'pending',
-                    timestamp: Date.now()
-                });
-                responseText = responseText.replace(/!!!ORDER_START!!![\s\S]*?!!!ORDER_END!!!/, "").trim() + "\n\n✅ *Pedido Recebido!*";
-            } catch(e) { console.error("Erro Pedido:", e); }
+        const userKey = sanitizePhone(rawFrom);
+        if (!chatHistory[userKey]) chatHistory[userKey] = [];
+        
+        // Salva msg do usuário
+        chatHistory[userKey].push({ role: 'user', parts: [{ text: incomingMsg }] });
+
+        // Processa IA
+        try {
+            if (!ai) throw new Error("IA offline (Verifique GEMINI_API_KEY)");
+
+            const result = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: chatHistory[userKey],
+                config: { systemInstruction: globalSystemInstruction + "\n\n" + globalKnowledgeBase }
+            });
+
+            let responseText = result.text;
+            
+            // Processa Pedidos
+            if (responseText.includes("!!!ORDER_START!!!")) {
+                try {
+                    const jsonBlock = responseText.split("!!!ORDER_START!!!")[1].split("!!!ORDER_END!!!")[0];
+                    const orderData = JSON.parse(jsonBlock);
+                    orders.unshift({
+                        id: `APP-${Date.now().toString().slice(-4)}`,
+                        customerName: orderData.nome_cliente || "Cliente",
+                        customerPhone: userKey,
+                        address: orderData.endereco_completo,
+                        items: orderData.itens || [],
+                        total: orderData.total_numerico || 0,
+                        status: 'pending',
+                        timestamp: Date.now()
+                    });
+                    responseText = responseText.replace(/!!!ORDER_START!!![\s\S]*?!!!ORDER_END!!!/, "").trim() + "\n\n✅ *Pedido Recebido!*";
+                } catch(e) { console.error("Erro Pedido:", e); }
+            }
+
+            chatHistory[userKey].push({ role: 'model', parts: [{ text: responseText }] });
+            await sendWhatsApp(userKey, responseText);
+
+        } catch (error) {
+            console.error("❌ Erro IA:", error);
+            lastWebhookPayload += " | Erro IA: " + error.message;
         }
-
-        chatHistory[userKey].push({ role: 'model', parts: [{ text: responseText }] });
-        await sendWhatsApp(userKey, responseText);
-
-    } catch (error) {
-        console.error("❌ Erro IA:", error);
+    } else {
+        lastWebhookPayload = `Erro: JSON Inválido. Recebido: ${JSON.stringify(body)}`;
+        console.error("❌ Erro: Campos não encontrados no JSON recebido.");
+        return res.status(400).send("JSON Inválido: Envie { number, message }");
     }
 
-    res.status(200).send('<Response></Response>'); 
+    res.status(200).send({ status: 'received' }); 
 });
 
-app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
+// Inicialização: Cria dados falsos para visualização se estiver vazio
+if (Object.keys(chatHistory).length === 0) {
+    console.log("⚠️ Iniciando com dados de exemplo...");
+    chatHistory["5511999999999"] = [
+        { role: 'user', parts: [{ text: "Oi, o bot está on?" }] },
+        { role: 'model', parts: [{ text: "Sim! Servidor Backend iniciado com sucesso. Aguardando mensagens reais..." }] }
+    ];
+}
+
+app.listen(PORT, () => console.log(`✅ SERVIDOR INICIADO! DADOS DE EXEMPLO CARREGADOS.`));
