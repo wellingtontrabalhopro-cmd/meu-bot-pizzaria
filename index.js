@@ -54,7 +54,14 @@ if (GEMINI_API_KEY) {
 // --- MEMÓRIA ---
 let globalSystemInstruction = "VOCÊ É UM ATENDENTE DE PIZZARIA.";
 let globalKnowledgeBase = "Cardápio vazio.";
-const chatHistory = {}; 
+
+// Inicia com um chat de exemplo para o usuário não ver tela vazia
+const chatHistory = {
+    "5511999999999": [
+        { role: 'user', parts: [{ text: "(Exemplo) Olá, tem pizza de queijo?" }] },
+        { role: 'model', parts: [{ text: "Olá! Sou o robô da pizzaria. Temos sim! A Média custa R$ 38,00." }] }
+    ]
+}; 
 let orders = [];
 
 // Função auxiliar para limpar telefone (remove @c.us, +, etc e deixa só numeros)
@@ -123,6 +130,7 @@ app.get('/', (req, res) => {
                 <li>Custom API: ${CUSTOM_SEND_URL ? '✅ ON' : '⚪ OFF'}</li>
                 <li>Rota Chats: ✅ /admin/chats (Ativo)</li>
             </ul>
+            <p>Use os endpoints <b>/webhook</b> para receber mensagens.</p>
         </div>
     `);
 });
@@ -151,22 +159,27 @@ app.post('/admin/orders/:id/status', (req, res) => {
     }
 });
 
-// --- AQUI ESTAVA FALTANDO A ROTA DE CHATS ---
+// --- ROTA DE CHATS (Crucial para o Frontend) ---
 app.get('/admin/chats', (req, res) => {
     console.log("🔍 Frontend requisitou lista de chats...");
     
-    // Converte o objeto chatHistory em um array bonito para o Frontend
-    const chats = Object.keys(chatHistory).map(phoneKey => {
-        const msgs = chatHistory[phoneKey];
-        return {
-            phone: phoneKey,
-            messages: msgs,
-            lastMessageTime: Date.now() // Poderia ser melhorado pegando o timestamp real da ultima msg
-        };
-    });
-    
-    console.log(`📦 Retornando ${chats.length} chats ativos.`);
-    res.json(chats);
+    try {
+        // Converte o objeto chatHistory em um array
+        const chats = Object.keys(chatHistory).map(phoneKey => {
+            const msgs = chatHistory[phoneKey];
+            return {
+                phone: phoneKey,
+                messages: msgs,
+                lastMessageTime: Date.now() 
+            };
+        });
+        
+        console.log(`📦 Retornando ${chats.length} chats ativos.`);
+        res.json(chats);
+    } catch (e) {
+        console.error("Erro ao listar chats:", e);
+        res.status(500).send("Erro interno ao listar chats");
+    }
 });
 
 // Teste de Envio
